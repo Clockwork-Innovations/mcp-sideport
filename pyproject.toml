@@ -28,7 +28,7 @@ dependencies = ["aiohttp>=3.9.0"]
 mcp-sideport = "mcp_sideport.daemon:main"
 
 [project.urls]
-Repository = "https://github.com/clockwork-innovations/mcp-sideport"
+Repository = "https://github.com/Clockwork-Innovations/mcp-sideport"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/mcp_sideport"]

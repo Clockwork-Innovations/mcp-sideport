@@ -118,7 +118,43 @@ Then in your HTML:
 | `/app/{id}` | GET | Session-based app page |
 | `/api/{name}` | GET | Custom read handlers |
 | `/api/action` | POST | Custom write handlers |
-| `/health` | GET | Health check |
+| `/health` | GET | Health check with uptime, version, MCP status |
+
+## Configuration
+
+### Request Body Size Limit
+
+Default: **5MB** - balances security with usability for JSON + base64 thumbnails.
+
+```python
+# For media uploads, increase the limit:
+daemon = SideportDaemon(
+    client_max_size=50 * 1024 * 1024,  # 50MB
+)
+```
+
+### Session TTL
+
+Default: **1 hour**. Sessions are automatically cleaned up after expiry.
+
+```python
+daemon = SideportDaemon(
+    session_ttl=7200,  # 2 hours
+)
+```
+
+### All Options
+
+```python
+SideportDaemon(
+    host="127.0.0.1",           # Bind address
+    port=3847,                   # Listen port
+    mcp_server_url="...",        # Upstream MCP server (enables HMR)
+    auto_open_browser=True,      # Open browser on /launch
+    session_ttl=3600,            # Session TTL in seconds
+    client_max_size=5*1024*1024, # Max request body (bytes)
+)
+```
 
 ## Future Compatibility
 

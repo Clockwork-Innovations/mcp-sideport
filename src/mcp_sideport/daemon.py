@@ -27,8 +27,9 @@ MCP_PROTOCOL_VERSION = "2025-03-26"
 class McpSession:
     """Represents an MCP protocol session with a client."""
 
-    def __init__(self, session_id: str, client_info: dict | None = None):
+    def __init__(self, session_id: str, agent_id: str | None = None, client_info: dict | None = None):
         self.session_id = session_id
+        self.agent_id = agent_id  # Links to the agent (Claude Code conversation)
         self.client_info = client_info or {}
         self.created = time.time()
         self.initialized = False  # True after receiving 'initialized' notification
@@ -43,11 +44,42 @@ class McpSession:
     def to_dict(self) -> dict:
         return {
             "sessionId": self.session_id,
+            "agentId": self.agent_id,
             "clientInfo": self.client_info,
             "created": self.created,
             "initialized": self.initialized,
             "lastActivity": self.last_activity,
             "appSessions": self.app_sessions,
+        }
+
+
+class Agent:
+    """
+    Represents an agent (e.g., a Claude Code conversation).
+
+    An agent can have multiple MCP sessions (reconnects, multiple tools)
+    and each MCP session can have multiple app sessions (browser UIs).
+    """
+
+    def __init__(self, agent_id: str, metadata: dict | None = None):
+        self.agent_id = agent_id
+        self.metadata = metadata or {}
+        self.created = time.time()
+        self.last_activity = time.time()
+        # MCP sessions belonging to this agent
+        self.mcp_sessions: list[str] = []
+
+    def touch(self):
+        """Update last activity timestamp."""
+        self.last_activity = time.time()
+
+    def to_dict(self) -> dict:
+        return {
+            "agentId": self.agent_id,
+            "metadata": self.metadata,
+            "created": self.created,
+            "lastActivity": self.last_activity,
+            "mcpSessions": self.mcp_sessions,
         }
 
 
@@ -104,6 +136,9 @@ class SideportDaemon:
         self.action_handlers = action_handlers or {}
         self.api_handlers = api_handlers or {}
 
+        # Agent storage: agent_id -> Agent
+        self.agents: dict[str, Agent] = {}
+
         # MCP session storage: mcp_session_id -> McpSession
         self.mcp_sessions: dict[str, McpSession] = {}
 
@@ -128,6 +163,16 @@ class SideportDaemon:
         app.router.add_get("/mcp", self.handle_mcp_get)
         app.router.add_delete("/mcp", self.handle_mcp_delete)
         app.router.add_options("/mcp", self.handle_cors_preflight)
+
+        # Agent/session routing endpoints
+        app.router.add_get("/agents", self.handle_list_agents)
+        app.router.add_get("/agents/{agent_id}", self.handle_get_agent)
+        app.router.add_get("/agents/{agent_id}/sessions", self.handle_get_agent_sessions)
+        app.router.add_get("/agents/{agent_id}/apps", self.handle_get_agent_apps)
+        app.router.add_delete("/agents/{agent_id}", self.handle_delete_agent)
+        app.router.add_options("/agents/{agent_id}", self.handle_cors_preflight)
+        app.router.add_options("/agents/{agent_id}/sessions", self.handle_cors_preflight)
+        app.router.add_options("/agents/{agent_id}/apps", self.handle_cors_preflight)
 
         # App routes (browser UI)
         app.router.add_get("/app/{session_id}", self.handle_app)
@@ -279,12 +324,32 @@ class SideportDaemon:
         client_info = params.get("clientInfo", {})
         protocol_version = params.get("protocolVersion")
 
-        # Create new session
+        # Extract agent ID from clientInfo
+        # Convention: clientInfo.agentId identifies the Claude Code conversation
+        agent_id = client_info.get("agentId")
+        agent_metadata = client_info.get("agentMetadata", {})
+
+        # Get or create agent
+        if agent_id:
+            agent = self._get_or_create_agent(agent_id, agent_metadata)
+        else:
+            agent = None
+
+        # Create new MCP session linked to agent
         session_id = self._generate_session_id()
-        session = McpSession(session_id, client_info)
+        session = McpSession(session_id, agent_id=agent_id, client_info=client_info)
         self.mcp_sessions[session_id] = session
 
-        logger.info(f"MCP session created: {session_id} for client {client_info.get('name', 'unknown')}")
+        # Register session with agent
+        if agent:
+            agent.mcp_sessions.append(session_id)
+            agent.touch()
+
+        logger.info(
+            f"MCP session created: {session_id} "
+            f"for client {client_info.get('name', 'unknown')} "
+            f"(agent: {agent_id or 'anonymous'})"
+        )
 
         result = {
             "protocolVersion": MCP_PROTOCOL_VERSION,
@@ -300,6 +365,20 @@ class SideportDaemon:
         # Return session ID in header per MCP spec
         response.headers["Mcp-Session-Id"] = session_id
         return response
+
+    def _get_or_create_agent(self, agent_id: str, metadata: dict | None = None) -> Agent:
+        """Get existing agent or create a new one."""
+        if agent_id in self.agents:
+            agent = self.agents[agent_id]
+            # Update metadata if provided
+            if metadata:
+                agent.metadata.update(metadata)
+            return agent
+
+        agent = Agent(agent_id, metadata)
+        self.agents[agent_id] = agent
+        logger.info(f"Agent registered: {agent_id}")
+        return agent
 
     def _get_method_handler(self, method: str) -> Callable | None:
         """Get handler for an MCP method."""
@@ -345,6 +424,28 @@ class SideportDaemon:
                     "properties": {},
                 },
             },
+            {
+                "name": "get_agent_sessions",
+                "description": "List all app sessions for this agent (across all MCP sessions)",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {},
+                },
+            },
+            {
+                "name": "adopt_session",
+                "description": "Adopt an orphaned app session from a previous MCP session",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "appSessionId": {
+                            "type": "string",
+                            "description": "The app session ID to adopt",
+                        },
+                    },
+                    "required": ["appSessionId"],
+                },
+            },
         ]
 
         # Add custom action handlers as tools
@@ -366,7 +467,11 @@ class SideportDaemon:
             return await self._tool_launch_app(session, arguments)
         elif tool_name == "get_sessions":
             return await self._tool_get_sessions(session, arguments)
-        elif tool_name.startswith("action_"):
+        elif tool_name == "get_agent_sessions":
+            return await self._tool_get_agent_sessions(session, arguments)
+        elif tool_name == "adopt_session":
+            return await self._tool_adopt_session(session, arguments)
+        elif tool_name and tool_name.startswith("action_"):
             action_name = tool_name[7:]  # Remove "action_" prefix
             return await self._tool_action(session, action_name, arguments)
 
@@ -419,14 +524,98 @@ class SideportDaemon:
         }
 
     async def _tool_get_sessions(self, session: McpSession, args: dict) -> dict:
-        """Get app sessions for this MCP client."""
+        """Get app sessions for this MCP session."""
         sessions = [
             self.app_sessions[sid]
             for sid in session.app_sessions
             if sid in self.app_sessions
         ]
         return {
-            "content": [{"type": "text", "text": json.dumps({"sessions": sessions})}]
+            "content": [{"type": "text", "text": json.dumps({
+                "mcpSessionId": session.session_id,
+                "sessions": sessions,
+            })}]
+        }
+
+    async def _tool_get_agent_sessions(self, session: McpSession, args: dict) -> dict:
+        """Get all app sessions for this agent across all MCP sessions."""
+        if not session.agent_id or session.agent_id not in self.agents:
+            return {
+                "content": [{"type": "text", "text": json.dumps({
+                    "agentId": None,
+                    "sessions": [],
+                    "note": "No agent ID associated with this session",
+                })}]
+            }
+
+        agent = self.agents[session.agent_id]
+        all_sessions = []
+
+        for mcp_sid in agent.mcp_sessions:
+            if mcp_sid in self.mcp_sessions:
+                mcp_session = self.mcp_sessions[mcp_sid]
+                for app_sid in mcp_session.app_sessions:
+                    if app_sid in self.app_sessions:
+                        app_data = self.app_sessions[app_sid].copy()
+                        app_data["mcpSessionId"] = mcp_sid
+                        app_data["isCurrentSession"] = mcp_sid == session.session_id
+                        all_sessions.append(app_data)
+
+        return {
+            "content": [{"type": "text", "text": json.dumps({
+                "agentId": session.agent_id,
+                "currentMcpSessionId": session.session_id,
+                "totalMcpSessions": len(agent.mcp_sessions),
+                "sessions": all_sessions,
+            })}]
+        }
+
+    async def _tool_adopt_session(self, session: McpSession, args: dict) -> dict:
+        """Adopt an orphaned app session into this MCP session."""
+        app_session_id = args.get("appSessionId")
+
+        if not app_session_id:
+            return {"content": [{"type": "text", "text": "appSessionId required"}], "isError": True}
+
+        if app_session_id not in self.app_sessions:
+            return {"content": [{"type": "text", "text": f"App session not found: {app_session_id}"}], "isError": True}
+
+        app_session = self.app_sessions[app_session_id]
+        old_mcp_session_id = app_session.get("mcpSessionId")
+
+        # Check if it's already owned by this session
+        if app_session_id in session.app_sessions:
+            return {
+                "content": [{"type": "text", "text": json.dumps({
+                    "status": "already_owned",
+                    "appSessionId": app_session_id,
+                })}]
+            }
+
+        # Check if old MCP session still exists (not orphaned)
+        if old_mcp_session_id and old_mcp_session_id in self.mcp_sessions:
+            old_session = self.mcp_sessions[old_mcp_session_id]
+            # Only allow adoption if same agent or the old session is terminated
+            if old_session.agent_id != session.agent_id:
+                return {
+                    "content": [{"type": "text", "text": "Cannot adopt session owned by different agent"}],
+                    "isError": True,
+                }
+            # Remove from old session
+            old_session.app_sessions = [sid for sid in old_session.app_sessions if sid != app_session_id]
+
+        # Adopt into current session
+        session.app_sessions.append(app_session_id)
+        app_session["mcpSessionId"] = session.session_id
+
+        logger.info(f"App session {app_session_id} adopted by MCP session {session.session_id}")
+
+        return {
+            "content": [{"type": "text", "text": json.dumps({
+                "status": "adopted",
+                "appSessionId": app_session_id,
+                "mcpSessionId": session.session_id,
+            })}]
         }
 
     async def _tool_action(self, session: McpSession, action_name: str, args: dict) -> dict:
@@ -496,13 +685,155 @@ class SideportDaemon:
         if not session:
             return web.Response(status=404, text="Session not found")
 
+        # Remove from agent's session list
+        if session.agent_id and session.agent_id in self.agents:
+            agent = self.agents[session.agent_id]
+            agent.mcp_sessions = [sid for sid in agent.mcp_sessions if sid != session_id]
+
         # Clean up app sessions belonging to this MCP session
         for app_sid in session.app_sessions:
             self.app_sessions.pop(app_sid, None)
             self.content_cache.pop(app_sid, None)
 
-        logger.info(f"MCP session terminated: {session_id}")
+        logger.info(f"MCP session terminated: {session_id} (agent: {session.agent_id or 'anonymous'})")
         return web.Response(status=204)
+
+    # ---- Agent routing endpoints ----
+
+    async def handle_list_agents(self, request: web.Request) -> web.Response:
+        """GET /agents - List all registered agents."""
+        cors_headers = {"Access-Control-Allow-Origin": "*"}
+
+        agents = [agent.to_dict() for agent in self.agents.values()]
+
+        # Enrich with counts
+        for agent_data in agents:
+            agent_id = agent_data["agentId"]
+            agent = self.agents[agent_id]
+            # Count active MCP sessions
+            active_sessions = [sid for sid in agent.mcp_sessions if sid in self.mcp_sessions]
+            # Count all app sessions across MCP sessions
+            app_count = sum(
+                len(self.mcp_sessions[sid].app_sessions)
+                for sid in active_sessions
+                if sid in self.mcp_sessions
+            )
+            agent_data["activeMcpSessions"] = len(active_sessions)
+            agent_data["activeAppSessions"] = app_count
+
+        return web.json_response({"agents": agents}, headers=cors_headers)
+
+    async def handle_get_agent(self, request: web.Request) -> web.Response:
+        """GET /agents/{agent_id} - Get agent details."""
+        cors_headers = {"Access-Control-Allow-Origin": "*"}
+        agent_id = request.match_info["agent_id"]
+
+        agent = self.agents.get(agent_id)
+        if not agent:
+            return web.json_response(
+                {"error": "Agent not found"},
+                status=404,
+                headers=cors_headers,
+            )
+
+        data = agent.to_dict()
+        # Enrich with session details
+        active_sessions = [sid for sid in agent.mcp_sessions if sid in self.mcp_sessions]
+        data["activeMcpSessions"] = len(active_sessions)
+        data["sessions"] = [
+            self.mcp_sessions[sid].to_dict()
+            for sid in active_sessions
+        ]
+
+        return web.json_response(data, headers=cors_headers)
+
+    async def handle_get_agent_sessions(self, request: web.Request) -> web.Response:
+        """GET /agents/{agent_id}/sessions - Get MCP sessions for an agent."""
+        cors_headers = {"Access-Control-Allow-Origin": "*"}
+        agent_id = request.match_info["agent_id"]
+
+        agent = self.agents.get(agent_id)
+        if not agent:
+            return web.json_response(
+                {"error": "Agent not found"},
+                status=404,
+                headers=cors_headers,
+            )
+
+        sessions = [
+            self.mcp_sessions[sid].to_dict()
+            for sid in agent.mcp_sessions
+            if sid in self.mcp_sessions
+        ]
+
+        return web.json_response({"sessions": sessions}, headers=cors_headers)
+
+    async def handle_get_agent_apps(self, request: web.Request) -> web.Response:
+        """GET /agents/{agent_id}/apps - Get all app sessions for an agent."""
+        cors_headers = {"Access-Control-Allow-Origin": "*"}
+        agent_id = request.match_info["agent_id"]
+
+        agent = self.agents.get(agent_id)
+        if not agent:
+            return web.json_response(
+                {"error": "Agent not found"},
+                status=404,
+                headers=cors_headers,
+            )
+
+        # Collect all app sessions across all MCP sessions for this agent
+        apps = []
+        for mcp_sid in agent.mcp_sessions:
+            if mcp_sid in self.mcp_sessions:
+                mcp_session = self.mcp_sessions[mcp_sid]
+                for app_sid in mcp_session.app_sessions:
+                    if app_sid in self.app_sessions:
+                        app_data = self.app_sessions[app_sid].copy()
+                        app_data["mcpSessionId"] = mcp_sid
+                        apps.append(app_data)
+
+        return web.json_response({"apps": apps}, headers=cors_headers)
+
+    async def handle_delete_agent(self, request: web.Request) -> web.Response:
+        """DELETE /agents/{agent_id} - Terminate all sessions for an agent."""
+        cors_headers = {"Access-Control-Allow-Origin": "*"}
+        agent_id = request.match_info["agent_id"]
+
+        agent = self.agents.get(agent_id)
+        if not agent:
+            return web.json_response(
+                {"error": "Agent not found"},
+                status=404,
+                headers=cors_headers,
+            )
+
+        # Terminate all MCP sessions and their app sessions
+        terminated_mcp = 0
+        terminated_apps = 0
+
+        for mcp_sid in list(agent.mcp_sessions):
+            if mcp_sid in self.mcp_sessions:
+                mcp_session = self.mcp_sessions[mcp_sid]
+                # Clean up app sessions
+                for app_sid in mcp_session.app_sessions:
+                    self.app_sessions.pop(app_sid, None)
+                    self.content_cache.pop(app_sid, None)
+                    terminated_apps += 1
+                # Remove MCP session
+                del self.mcp_sessions[mcp_sid]
+                terminated_mcp += 1
+
+        # Remove agent
+        del self.agents[agent_id]
+
+        logger.info(f"Agent terminated: {agent_id} ({terminated_mcp} MCP sessions, {terminated_apps} apps)")
+
+        return web.json_response({
+            "status": "terminated",
+            "agentId": agent_id,
+            "terminatedMcpSessions": terminated_mcp,
+            "terminatedAppSessions": terminated_apps,
+        }, headers=cors_headers)
 
     # ---- App serving endpoints ----
 
@@ -670,6 +1001,7 @@ class SideportDaemon:
         """GET /health - Health check."""
         return web.json_response({
             "status": "ok",
+            "agents": len(self.agents),
             "mcpSessions": len(self.mcp_sessions),
             "appSessions": len(self.app_sessions),
             "upstreamMcp": self.mcp_server_url or "not configured",

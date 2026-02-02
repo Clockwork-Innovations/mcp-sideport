@@ -60,8 +60,10 @@ class SideportDaemon:
         self.action_handlers = action_handlers or {}
         self.api_handlers = api_handlers or {}
 
-        # Session storage
+        # Session storage: session_id -> session data
         self.sessions: dict[str, dict] = {}
+        # Agent index: agent_id -> list of session_ids (one agent can have multiple sessions)
+        self.agent_sessions: dict[str, list[str]] = {}
         self.content_cache: dict[str, str] = {}
         self._html_cache: dict = {"html": None, "time": 0, "mcp_session_id": None}
 
@@ -76,6 +78,12 @@ class SideportDaemon:
         app.router.add_get("/app/{session_id}", self.handle_app)
         app.router.add_get("/dashboard", self.handle_dashboard)
         app.router.add_get("/health", self.handle_health)
+
+        # Session management routes
+        app.router.add_get("/sessions", self.handle_list_sessions)
+        app.router.add_get("/sessions/{session_id}", self.handle_get_session)
+        app.router.add_delete("/sessions/{session_id}", self.handle_delete_session)
+        app.router.add_options("/sessions/{session_id}", self.handle_cors_preflight)
 
         # API routes
         app.router.add_get("/api/{name}", self.handle_api_get)
@@ -101,19 +109,28 @@ class SideportDaemon:
 
         resource_uri = data.get("resourceUri")
         title = data.get("title", "MCP App")
+        agent_id = data.get("agentId")  # Claude Code conversation/session ID
 
         if not resource_uri:
             return web.json_response({"error": "resourceUri required"}, status=400)
 
-        # Create session
+        # Create session paired with agent
         session_id = str(uuid4())
-        self.sessions[session_id] = {
+        session = {
             "sessionId": session_id,
+            "agentId": agent_id,
             "resourceUri": resource_uri,
             "title": title,
             "created": time.time(),
             "status": "pending",
         }
+        self.sessions[session_id] = session
+
+        # Index by agent_id for lookups
+        if agent_id:
+            if agent_id not in self.agent_sessions:
+                self.agent_sessions[agent_id] = []
+            self.agent_sessions[agent_id].append(session_id)
 
         app_url = f"http://{self.host}:{self.port}/app/{session_id}"
 
@@ -124,12 +141,13 @@ class SideportDaemon:
         if self.auto_open_browser:
             try:
                 webbrowser.open(app_url)
-                logger.info(f"Opened browser for session {session_id}")
+                logger.info(f"Opened browser for session {session_id} (agent: {agent_id})")
             except Exception as e:
                 logger.warning(f"Failed to open browser: {e}")
 
         return web.json_response({
             "sessionId": session_id,
+            "agentId": agent_id,
             "status": "pending",
             "appUrl": app_url,
         })
@@ -144,9 +162,14 @@ class SideportDaemon:
                 html = await self._fetch_from_mcp(resource_uri)
                 if html:
                     self.content_cache[session_id] = html
+                    if session_id in self.sessions:
+                        self.sessions[session_id]["status"] = "ready"
                     return
             except Exception as e:
                 logger.warning(f"Failed to fetch from MCP: {e}")
+                if session_id in self.sessions:
+                    self.sessions[session_id]["status"] = "error"
+                    self.sessions[session_id]["error"] = str(e)
 
     async def _fetch_from_mcp(self, resource_uri: str) -> Optional[str]:
         """Fetch HTML from MCP server resource endpoint."""
@@ -303,8 +326,68 @@ class SideportDaemon:
         return web.json_response({
             "status": "ok",
             "sessions": len(self.sessions),
+            "agents": len(self.agent_sessions),
             "mcp_server": self.mcp_server_url or "not configured",
         })
+
+    async def handle_list_sessions(self, request: web.Request) -> web.Response:
+        """GET /sessions - List sessions, optionally filtered by agent_id."""
+        cors_headers = {"Access-Control-Allow-Origin": "*"}
+        agent_id = request.query.get("agentId")
+
+        if agent_id:
+            # Return sessions for specific agent
+            session_ids = self.agent_sessions.get(agent_id, [])
+            sessions = [self.sessions[sid] for sid in session_ids if sid in self.sessions]
+        else:
+            # Return all sessions
+            sessions = list(self.sessions.values())
+
+        return web.json_response({"sessions": sessions}, headers=cors_headers)
+
+    async def handle_get_session(self, request: web.Request) -> web.Response:
+        """GET /sessions/{session_id} - Get session details."""
+        cors_headers = {"Access-Control-Allow-Origin": "*"}
+        session_id = request.match_info["session_id"]
+
+        session = self.sessions.get(session_id)
+        if not session:
+            return web.json_response(
+                {"error": "Session not found"},
+                status=404,
+                headers=cors_headers,
+            )
+
+        return web.json_response(session, headers=cors_headers)
+
+    async def handle_delete_session(self, request: web.Request) -> web.Response:
+        """DELETE /sessions/{session_id} - Close and remove a session."""
+        cors_headers = {"Access-Control-Allow-Origin": "*"}
+        session_id = request.match_info["session_id"]
+
+        session = self.sessions.get(session_id)
+        if not session:
+            return web.json_response(
+                {"error": "Session not found"},
+                status=404,
+                headers=cors_headers,
+            )
+
+        # Remove from agent index
+        agent_id = session.get("agentId")
+        if agent_id and agent_id in self.agent_sessions:
+            self.agent_sessions[agent_id] = [
+                sid for sid in self.agent_sessions[agent_id] if sid != session_id
+            ]
+            # Clean up empty agent entries
+            if not self.agent_sessions[agent_id]:
+                del self.agent_sessions[agent_id]
+
+        # Remove session and cached content
+        del self.sessions[session_id]
+        self.content_cache.pop(session_id, None)
+
+        return web.json_response({"status": "deleted", "sessionId": session_id}, headers=cors_headers)
 
     async def handle_cors_preflight(self, request: web.Request) -> web.Response:
         """Handle CORS preflight."""
@@ -332,7 +415,11 @@ class SideportDaemon:
 
         try:
             args = dict(request.query)
-            result = handler(**args) if args else handler()
+            # Support both sync and async handlers
+            if asyncio.iscoroutinefunction(handler):
+                result = await handler(**args) if args else await handler()
+            else:
+                result = handler(**args) if args else handler()
             return web.json_response(result, headers=cors_headers)
         except Exception as e:
             logger.error(f"API error ({name}): {e}")
@@ -362,7 +449,11 @@ class SideportDaemon:
             )
 
         try:
-            result = handler(**args)
+            # Support both sync and async handlers
+            if asyncio.iscoroutinefunction(handler):
+                result = await handler(**args)
+            else:
+                result = handler(**args)
             return web.json_response(result, headers=cors_headers)
         except Exception as e:
             logger.error(f"Action error ({action}): {e}")

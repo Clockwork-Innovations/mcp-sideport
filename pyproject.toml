@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "mcp-sideport"
-version = "0.1.0"
+version = "0.0.2"
 description = "MCP Apps bridge for AI coding tools - browser UIs with REST fallback"
 readme = "README.md"
 license = "MIT"
@@ -24,6 +24,14 @@ classifiers = [
 ]
 dependencies = ["aiohttp>=3.9.0"]
 
+[project.optional-dependencies]
+dev = [
+    "pytest>=9.0.0",
+    "pytest-asyncio>=1.0.0",
+    "pytest-aiohttp>=1.1.0",
+    "ruff>=0.14.0",
+]
+
 [project.scripts]
 mcp-sideport = "mcp_sideport.daemon:main"
 
@@ -32,3 +40,20 @@ Repository = "https://github.com/Clockwork-Innovations/mcp-sideport"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/mcp_sideport"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W"]
+ignore = ["E501"]  # Line too long (handled by formatter)
+
+[tool.ruff.format]
+quote-style = "double"

@@ -22,8 +22,10 @@ from aiohttp import web
 
 logger = logging.getLogger("mcp_sideport")
 
-# Default max request body size (1MB)
-DEFAULT_CLIENT_MAX_SIZE = 1024 * 1024
+# Default max request body size (5MB)
+# Conservative default for JSON + base64 thumbnails. Increase for media uploads.
+# Example: SideportDaemon(client_max_size=50 * 1024 * 1024)  # 50MB
+DEFAULT_CLIENT_MAX_SIZE = 5 * 1024 * 1024
 
 # MCP fetch retry settings
 MCP_FETCH_MAX_RETRIES = 2

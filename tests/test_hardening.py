@@ -20,9 +20,10 @@ class TestRequestBodyLimits:
     """Test request body size limits."""
 
     def test_default_client_max_size(self):
-        """Daemon uses default client_max_size."""
+        """Daemon uses default client_max_size (5MB)."""
         daemon = SideportDaemon(auto_open_browser=False)
         assert daemon.client_max_size == DEFAULT_CLIENT_MAX_SIZE
+        assert daemon.client_max_size == 5 * 1024 * 1024  # 5MB
 
     def test_custom_client_max_size(self):
         """Daemon accepts custom client_max_size."""

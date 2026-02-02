@@ -2,7 +2,7 @@
 MCP Sideport Daemon
 
 MCP server using Streamable HTTP transport that serves browser UIs to AI coding tools.
-Stateless session management - routing info encoded in Mcp-Session-Id token.
+Maintains state for SSE connections to route messages from browser UIs back to MCP clients.
 """
 
 import asyncio
@@ -25,28 +25,19 @@ logger = logging.getLogger("mcp_sideport")
 # MCP Protocol version
 MCP_PROTOCOL_VERSION = "2025-03-26"
 
-# Secret for signing session tokens (generate on startup)
+# Secret for signing session tokens
 _SESSION_SECRET = os.environ.get("MCP_SESSION_SECRET", os.urandom(32).hex())
 
 
 def _encode_session_token(data: dict) -> str:
-    """
-    Encode session data into a signed token.
-
-    Token format: base64(json) + "." + signature
-    Contains routing info so server can be stateless.
-    """
+    """Encode session data into a signed token for the Mcp-Session-Id header."""
     payload = base64.urlsafe_b64encode(json.dumps(data).encode()).decode().rstrip("=")
     sig = hmac.new(_SESSION_SECRET.encode(), payload.encode(), hashlib.sha256).hexdigest()[:16]
     return f"{payload}.{sig}"
 
 
 def _decode_session_token(token: str) -> dict | None:
-    """
-    Decode and verify a session token.
-
-    Returns the decoded data or None if invalid.
-    """
+    """Decode and verify a session token."""
     try:
         parts = token.split(".")
         if len(parts) != 2:
@@ -59,7 +50,6 @@ def _decode_session_token(token: str) -> dict | None:
             logger.warning("Invalid session token signature")
             return None
 
-        # Add padding back for base64 decode
         padding = 4 - len(payload) % 4
         if padding != 4:
             payload += "=" * padding
@@ -70,23 +60,82 @@ def _decode_session_token(token: str) -> dict | None:
         return None
 
 
+class McpSession:
+    """
+    Active MCP session state.
+
+    Required for:
+    - SSE connection to send server-initiated messages to client
+    - Routing messages from browser UIs back to the correct client
+    - Tracking pending requests for progress/cancellation
+    """
+
+    def __init__(self, session_id: str, agent_id: str | None, client_info: dict):
+        self.session_id = session_id
+        self.agent_id = agent_id
+        self.client_info = client_info
+        self.created = time.time()
+        self.last_activity = time.time()
+        self.initialized = False
+
+        # SSE message queue for server-to-client messages
+        self.sse_queue: asyncio.Queue = asyncio.Queue()
+
+        # Active SSE connections (can have multiple per session)
+        self.sse_connections: list[web.StreamResponse] = []
+
+        # App sessions launched by this MCP client
+        self.app_sessions: list[str] = []
+
+        # Pending requests (for progress tracking)
+        self.pending_requests: dict[Any, dict] = {}
+
+    def touch(self):
+        self.last_activity = time.time()
+
+    async def send_to_client(self, message: dict) -> bool:
+        """Send a JSON-RPC message to the client via SSE."""
+        if not self.sse_connections:
+            logger.warning(f"No SSE connection for session {self.session_id}")
+            return False
+
+        data = f"data: {json.dumps(message)}\n\n"
+        for conn in self.sse_connections:
+            try:
+                await conn.write(data.encode())
+            except Exception as e:
+                logger.warning(f"Failed to write to SSE: {e}")
+        return True
+
+    def to_dict(self) -> dict:
+        return {
+            "sessionId": self.session_id,
+            "agentId": self.agent_id,
+            "clientInfo": self.client_info,
+            "created": self.created,
+            "lastActivity": self.last_activity,
+            "initialized": self.initialized,
+            "hasSSE": len(self.sse_connections) > 0,
+            "appSessions": self.app_sessions,
+        }
+
+
 class SideportDaemon:
     """
     MCP server with Streamable HTTP transport for serving browser UIs.
 
-    Stateless design:
-    - Mcp-Session-Id is a signed token containing routing info (agentId, etc.)
-    - No server-side session state needed for MCP protocol
-    - Only app sessions (browser UIs) require state (for HTML caching)
+    State Management:
+    - MCP sessions: Track active clients with SSE connections for bidirectional communication
+    - App sessions: Map browser UIs to their owning MCP client for routing
 
     MCP Endpoints:
-    - POST /mcp - JSON-RPC messages
-    - GET /mcp - SSE stream (placeholder)
-    - DELETE /mcp - Session termination acknowledgment
+    - POST /mcp - JSON-RPC requests/notifications from client
+    - GET /mcp - SSE stream for server-to-client messages
+    - DELETE /mcp - Session termination
 
     App Endpoints:
     - GET /app/{id} - Serve browser UI
-    - GET /dashboard - Direct dashboard access
+    - POST /app/{id}/message - Browser UI sends message to its MCP client
     - GET /health - Health check
     """
 
@@ -116,8 +165,12 @@ class SideportDaemon:
         self.action_handlers = action_handlers or {}
         self.api_handlers = api_handlers or {}
 
-        # Only state needed: app sessions for browser UI serving
-        # Key: app_session_id, Value: {agentId, resourceUri, title, created, status}
+        # MCP session state: session_id -> McpSession
+        # Required for SSE connections and routing
+        self.mcp_sessions: dict[str, McpSession] = {}
+
+        # App session state: app_session_id -> app data
+        # Includes mcp_session_id for routing back to client
         self.app_sessions: dict[str, dict] = {}
         self.content_cache: dict[str, str] = {}
 
@@ -138,11 +191,14 @@ class SideportDaemon:
 
         # App routes (browser UI)
         app.router.add_get("/app/{session_id}", self.handle_app)
+        app.router.add_post("/app/{session_id}/message", self.handle_app_message)
+        app.router.add_options("/app/{session_id}/message", self.handle_cors_preflight)
         app.router.add_get("/dashboard", self.handle_dashboard)
         app.router.add_get("/health", self.handle_health)
 
-        # Query endpoints (for clients to find their apps)
+        # Query endpoints
         app.router.add_get("/apps", self.handle_list_apps)
+        app.router.add_get("/sessions", self.handle_list_sessions)
         app.router.add_delete("/apps/{session_id}", self.handle_delete_app)
         app.router.add_options("/apps/{session_id}", self.handle_cors_preflight)
 
@@ -208,7 +264,7 @@ class SideportDaemon:
         if method == "initialize":
             return await self._handle_initialize(params, msg_id)
 
-        # All other methods - decode session from header
+        # All other methods require valid session
         session_token = request.headers.get("Mcp-Session-Id")
         if not session_token:
             return web.json_response(
@@ -216,16 +272,28 @@ class SideportDaemon:
                 status=400,
             )
 
-        session = _decode_session_token(session_token)
+        # Look up session state
+        session = self.mcp_sessions.get(session_token)
         if not session:
+            # Try to validate token (session might have been created but not stored)
+            token_data = _decode_session_token(session_token)
+            if not token_data:
+                return web.json_response(
+                    {"jsonrpc": "2.0", "error": {"code": -32600, "message": "Invalid or expired session"}},
+                    status=404,
+                )
+            # Token valid but session not found (terminated)
             return web.json_response(
-                {"jsonrpc": "2.0", "error": {"code": -32600, "message": "Invalid or expired session"}},
+                {"jsonrpc": "2.0", "error": {"code": -32600, "message": "Session terminated"}},
                 status=404,
             )
 
+        session.touch()
+
         # Handle initialized notification
         if method == "initialized":
-            logger.info(f"MCP session initialized for agent: {session.get('agentId', 'anonymous')}")
+            session.initialized = True
+            logger.info(f"MCP session initialized for agent: {session.agent_id or 'anonymous'}")
             return web.Response(status=202)
 
         # Dispatch to method handlers
@@ -263,26 +331,27 @@ class SideportDaemon:
         """
         Handle initialize request.
 
-        Creates a signed session token containing routing info.
-        No server-side state needed - everything in the token.
+        Creates session state for SSE routing and a signed token for the header.
         """
         client_info = params.get("clientInfo", {})
-
-        # Extract routing info from clientInfo
         agent_id = client_info.get("agentId")
 
-        # Create session token with routing info
+        # Create session token (signed, for header)
         session_data = {
             "agentId": agent_id,
             "clientName": client_info.get("name", "unknown"),
             "clientVersion": client_info.get("version", "0.0.0"),
             "created": time.time(),
         }
-
         session_token = _encode_session_token(session_data)
 
+        # Create session state (for SSE connections and routing)
+        session = McpSession(session_token, agent_id, client_info)
+        self.mcp_sessions[session_token] = session
+
         logger.info(
-            f"MCP session created for client {client_info.get('name', 'unknown')} "
+            f"MCP session created: {session_token[:20]}... "
+            f"for client {client_info.get('name', 'unknown')} "
             f"(agent: {agent_id or 'anonymous'})"
         )
 
@@ -309,11 +378,11 @@ class SideportDaemon:
         }
         return handlers.get(method)
 
-    async def _handle_ping(self, session: dict, params: dict) -> dict:
+    async def _handle_ping(self, session: McpSession, params: dict) -> dict:
         """Handle ping request."""
         return {}
 
-    async def _handle_tools_list(self, session: dict, params: dict) -> dict:
+    async def _handle_tools_list(self, session: McpSession, params: dict) -> dict:
         """List available tools."""
         tools = [
             {
@@ -358,7 +427,7 @@ class SideportDaemon:
 
         return {"tools": tools}
 
-    async def _handle_tools_call(self, session: dict, params: dict) -> dict:
+    async def _handle_tools_call(self, session: McpSession, params: dict) -> dict:
         """Execute a tool call."""
         tool_name = params.get("name")
         arguments = params.get("arguments", {})
@@ -375,25 +444,28 @@ class SideportDaemon:
 
         return {"content": [{"type": "text", "text": f"Unknown tool: {tool_name}"}], "isError": True}
 
-    async def _tool_launch_app(self, session: dict, args: dict) -> dict:
-        """Launch a browser app session."""
+    async def _tool_launch_app(self, session: McpSession, args: dict) -> dict:
+        """Launch a browser app session linked to this MCP session."""
         resource_uri = args.get("resourceUri")
         title = args.get("title", "MCP App")
-        agent_id = session.get("agentId")
 
         if not resource_uri:
             return {"content": [{"type": "text", "text": "resourceUri required"}], "isError": True}
 
-        # Create app session (this requires state - caching HTML)
+        # Create app session linked to MCP session for routing
         app_session_id = str(uuid4())
         self.app_sessions[app_session_id] = {
             "sessionId": app_session_id,
-            "agentId": agent_id,
+            "mcpSessionId": session.session_id,  # Link to MCP session for routing
+            "agentId": session.agent_id,
             "resourceUri": resource_uri,
             "title": title,
             "created": time.time(),
             "status": "pending",
         }
+
+        # Track in MCP session
+        session.app_sessions.append(app_session_id)
 
         app_url = f"http://{self.host}:{self.port}/app/{app_session_id}"
 
@@ -403,7 +475,7 @@ class SideportDaemon:
         if self.auto_open_browser:
             try:
                 webbrowser.open(app_url)
-                logger.info(f"Opened browser for app {app_session_id} (agent: {agent_id})")
+                logger.info(f"Opened browser for app {app_session_id} (agent: {session.agent_id})")
             except Exception as e:
                 logger.warning(f"Failed to open browser: {e}")
 
@@ -418,30 +490,28 @@ class SideportDaemon:
             }]
         }
 
-    async def _tool_list_apps(self, session: dict, args: dict) -> dict:
-        """List app sessions for this agent."""
-        agent_id = session.get("agentId")
-
-        # Filter apps by agent ID (or return all if no agent ID)
-        if agent_id:
-            apps = [
-                app for app in self.app_sessions.values()
-                if app.get("agentId") == agent_id
-            ]
-        else:
-            apps = list(self.app_sessions.values())
+    async def _tool_list_apps(self, session: McpSession, args: dict) -> dict:
+        """List app sessions for this MCP session."""
+        apps = [
+            self.app_sessions[sid]
+            for sid in session.app_sessions
+            if sid in self.app_sessions
+        ]
 
         return {
             "content": [{
                 "type": "text",
-                "text": json.dumps({"agentId": agent_id, "apps": apps}),
+                "text": json.dumps({
+                    "mcpSessionId": session.session_id[:20] + "...",
+                    "agentId": session.agent_id,
+                    "apps": apps,
+                }),
             }]
         }
 
-    async def _tool_close_app(self, session: dict, args: dict) -> dict:
+    async def _tool_close_app(self, session: McpSession, args: dict) -> dict:
         """Close an app session."""
         app_session_id = args.get("appSessionId")
-        agent_id = session.get("agentId")
 
         if not app_session_id:
             return {"content": [{"type": "text", "text": "appSessionId required"}], "isError": True}
@@ -450,9 +520,12 @@ class SideportDaemon:
         if not app:
             return {"content": [{"type": "text", "text": f"App not found: {app_session_id}"}], "isError": True}
 
-        # Verify ownership (if agent ID is set)
-        if agent_id and app.get("agentId") != agent_id:
-            return {"content": [{"type": "text", "text": "Cannot close app owned by different agent"}], "isError": True}
+        # Verify ownership
+        if app.get("mcpSessionId") != session.session_id:
+            return {"content": [{"type": "text", "text": "Cannot close app owned by different session"}], "isError": True}
+
+        # Remove from session tracking
+        session.app_sessions = [sid for sid in session.app_sessions if sid != app_session_id]
 
         # Remove app session
         del self.app_sessions[app_session_id]
@@ -465,7 +538,7 @@ class SideportDaemon:
             }]
         }
 
-    async def _tool_action(self, session: dict, action_name: str, args: dict) -> dict:
+    async def _tool_action(self, session: McpSession, action_name: str, args: dict) -> dict:
         """Execute a custom action."""
         handler = self.action_handlers.get(action_name)
         if not handler:
@@ -480,7 +553,7 @@ class SideportDaemon:
         except Exception as e:
             return {"content": [{"type": "text", "text": str(e)}], "isError": True}
 
-    async def _handle_resources_list(self, session: dict, params: dict) -> dict:
+    async def _handle_resources_list(self, session: McpSession, params: dict) -> dict:
         """List available resources."""
         return {
             "resources": [{
@@ -490,7 +563,7 @@ class SideportDaemon:
             }]
         }
 
-    async def _handle_resources_read(self, session: dict, params: dict) -> dict:
+    async def _handle_resources_read(self, session: McpSession, params: dict) -> dict:
         """Read a resource."""
         uri = params.get("uri")
 
@@ -501,43 +574,139 @@ class SideportDaemon:
         return {"contents": []}
 
     async def handle_mcp_get(self, request: web.Request) -> web.Response:
-        """GET /mcp - SSE stream (placeholder)."""
-        return web.Response(status=405, text="SSE streaming not yet supported")
-
-    async def handle_mcp_delete(self, request: web.Request) -> web.Response:
         """
-        DELETE /mcp - Session termination.
+        GET /mcp - SSE stream for server-to-client messages.
 
-        Since we're stateless, just acknowledge. Client's token becomes unused.
-        Optionally clean up app sessions for this agent.
+        Keeps connection open so server can send notifications/requests to client.
+        Required for routing messages from browser UIs back to the MCP client.
         """
         session_token = request.headers.get("Mcp-Session-Id")
         if not session_token:
             return web.Response(status=400, text="Mcp-Session-Id header required")
 
-        session = _decode_session_token(session_token)
+        session = self.mcp_sessions.get(session_token)
         if not session:
-            return web.Response(status=404, text="Invalid session")
+            return web.Response(status=404, text="Session not found")
 
-        agent_id = session.get("agentId")
+        # Create SSE response
+        response = web.StreamResponse(
+            status=200,
+            headers={
+                "Content-Type": "text/event-stream",
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "Access-Control-Allow-Origin": "*",
+            },
+        )
+        await response.prepare(request)
 
-        # Optionally clean up app sessions for this agent
-        if agent_id:
-            to_remove = [
-                sid for sid, app in self.app_sessions.items()
-                if app.get("agentId") == agent_id
-            ]
-            for sid in to_remove:
-                del self.app_sessions[sid]
-                self.content_cache.pop(sid, None)
+        # Register this SSE connection
+        session.sse_connections.append(response)
+        logger.info(f"SSE connection opened for session {session_token[:20]}...")
 
-            if to_remove:
-                logger.info(f"Cleaned up {len(to_remove)} app sessions for agent {agent_id}")
+        try:
+            # Keep connection alive, send heartbeat every 30s
+            while True:
+                try:
+                    # Check if there are messages to send
+                    try:
+                        message = await asyncio.wait_for(session.sse_queue.get(), timeout=30.0)
+                        await response.write(f"data: {json.dumps(message)}\n\n".encode())
+                    except asyncio.TimeoutError:
+                        # Send heartbeat comment
+                        await response.write(b": heartbeat\n\n")
+                except ConnectionResetError:
+                    break
+        finally:
+            # Unregister SSE connection
+            session.sse_connections = [c for c in session.sse_connections if c != response]
+            logger.info(f"SSE connection closed for session {session_token[:20]}...")
 
-        logger.info(f"MCP session terminated for agent: {agent_id or 'anonymous'}")
+        return response
+
+    async def handle_mcp_delete(self, request: web.Request) -> web.Response:
+        """
+        DELETE /mcp - Terminate MCP session.
+
+        Cleans up session state, SSE connections, and app sessions.
+        """
+        session_token = request.headers.get("Mcp-Session-Id")
+        if not session_token:
+            return web.Response(status=400, text="Mcp-Session-Id header required")
+
+        session = self.mcp_sessions.pop(session_token, None)
+        if not session:
+            return web.Response(status=404, text="Session not found")
+
+        # Close SSE connections
+        for conn in session.sse_connections:
+            try:
+                await conn.write_eof()
+            except Exception:
+                pass
+
+        # Clean up app sessions
+        for app_sid in session.app_sessions:
+            self.app_sessions.pop(app_sid, None)
+            self.content_cache.pop(app_sid, None)
+
+        logger.info(
+            f"MCP session terminated: {session_token[:20]}... "
+            f"(agent: {session.agent_id or 'anonymous'}, "
+            f"apps: {len(session.app_sessions)})"
+        )
         return web.Response(status=204)
 
     # ---- App Session Endpoints ----
+
+    async def handle_app_message(self, request: web.Request) -> web.Response:
+        """
+        POST /app/{session_id}/message - Browser UI sends message to its MCP client.
+
+        Routes the message through the SSE connection to the owning MCP client.
+        This enables bidirectional communication: Browser UI -> Sideport -> MCP Client.
+        """
+        cors_headers = {"Access-Control-Allow-Origin": "*"}
+        app_session_id = request.match_info["session_id"]
+
+        app = self.app_sessions.get(app_session_id)
+        if not app:
+            return web.json_response({"error": "App not found"}, status=404, headers=cors_headers)
+
+        # Get the MCP session for routing
+        mcp_session_id = app.get("mcpSessionId")
+        mcp_session = self.mcp_sessions.get(mcp_session_id) if mcp_session_id else None
+
+        if not mcp_session:
+            return web.json_response(
+                {"error": "MCP session not found - client may have disconnected"},
+                status=404,
+                headers=cors_headers,
+            )
+
+        try:
+            data = await request.json()
+        except json.JSONDecodeError:
+            return web.json_response({"error": "Invalid JSON"}, status=400, headers=cors_headers)
+
+        # Queue message for delivery via SSE
+        message = {
+            "jsonrpc": "2.0",
+            "method": "notifications/message",
+            "params": {
+                "appSessionId": app_session_id,
+                "agentId": app.get("agentId"),
+                "data": data,
+            },
+        }
+
+        if mcp_session.sse_connections:
+            await mcp_session.send_to_client(message)
+            return web.json_response({"status": "sent"}, headers=cors_headers)
+        else:
+            # Queue for later if no active SSE connection
+            await mcp_session.sse_queue.put(message)
+            return web.json_response({"status": "queued"}, headers=cors_headers)
 
     async def handle_list_apps(self, request: web.Request) -> web.Response:
         """GET /apps - List app sessions, optionally filtered by agentId."""
@@ -551,18 +720,32 @@ class SideportDaemon:
 
         return web.json_response({"apps": apps}, headers=cors_headers)
 
+    async def handle_list_sessions(self, request: web.Request) -> web.Response:
+        """GET /sessions - List active MCP sessions."""
+        cors_headers = {"Access-Control-Allow-Origin": "*"}
+
+        sessions = [session.to_dict() for session in self.mcp_sessions.values()]
+        return web.json_response({"sessions": sessions}, headers=cors_headers)
+
     async def handle_delete_app(self, request: web.Request) -> web.Response:
         """DELETE /apps/{session_id} - Close an app session."""
         cors_headers = {"Access-Control-Allow-Origin": "*"}
-        session_id = request.match_info["session_id"]
+        app_session_id = request.match_info["session_id"]
 
-        if session_id not in self.app_sessions:
+        app = self.app_sessions.get(app_session_id)
+        if not app:
             return web.json_response({"error": "App not found"}, status=404, headers=cors_headers)
 
-        del self.app_sessions[session_id]
-        self.content_cache.pop(session_id, None)
+        # Remove from owning MCP session
+        mcp_session_id = app.get("mcpSessionId")
+        if mcp_session_id and mcp_session_id in self.mcp_sessions:
+            mcp_session = self.mcp_sessions[mcp_session_id]
+            mcp_session.app_sessions = [sid for sid in mcp_session.app_sessions if sid != app_session_id]
 
-        return web.json_response({"status": "closed", "sessionId": session_id}, headers=cors_headers)
+        del self.app_sessions[app_session_id]
+        self.content_cache.pop(app_session_id, None)
+
+        return web.json_response({"status": "closed", "sessionId": app_session_id}, headers=cors_headers)
 
     async def _fetch_content(self, app_session_id: str, resource_uri: str) -> None:
         """Fetch content from upstream MCP server or use placeholder."""
@@ -721,8 +904,11 @@ class SideportDaemon:
 
     async def handle_health(self, request: web.Request) -> web.Response:
         """GET /health - Health check."""
+        sse_count = sum(len(s.sse_connections) for s in self.mcp_sessions.values())
         return web.json_response({
             "status": "ok",
+            "mcpSessions": len(self.mcp_sessions),
+            "sseConnections": sse_count,
             "appSessions": len(self.app_sessions),
             "upstreamMcp": self.mcp_server_url or "not configured",
             "protocolVersion": MCP_PROTOCOL_VERSION,
